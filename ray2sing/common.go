@@ -3,12 +3,15 @@ package ray2sing
 //based on https://github.com/XTLS/Xray-core/issues/91
 //todo merge with https://github.com/XTLS/libXray/
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"strconv"
-
 	"strings"
 	"time"
 
@@ -17,12 +20,78 @@ import (
 	T "github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json/badoption"
+
+	"github.com/miekg/dns"
 )
 
 const USER_AGENT string = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
 
 type ParserFunc func(string) (*option.Outbound, error)
 type EndpointParserFunc func(string) (*T.Endpoint, error)
+
+// fetchECHConfigFromDoH queries a DoH server for HTTPS records and extracts ECH configlist.
+// Input format: "domain+https://doh-url" (v2rayN/v2rayNG style)
+// Returns PEM-formatted ECH configlist string, or empty on failure.
+func fetchECHConfigFromDoH(echParam string) string {
+	parts := strings.SplitN(echParam, "+", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	echDomain := parts[0]
+	dohURL := strings.TrimPrefix(parts[1], "https://")
+	if !strings.HasPrefix(parts[1], "https://") {
+		dohURL = parts[1]
+	}
+	dohURL = "https://" + dohURL
+
+	msg := new(dns.Msg)
+	msg.SetQuestion(dns.Fqdn(echDomain), dns.TypeHTTPS)
+	msg.RecursionDesired = true
+
+	data, err := msg.Pack()
+	if err != nil {
+		return ""
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Post(dohURL, "application/dns-message", bytes.NewReader(data))
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	respData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+
+	respMsg := new(dns.Msg)
+	if err := respMsg.Unpack(respData); err != nil {
+		return ""
+	}
+
+	for _, answer := range respMsg.Answer {
+		if httpsRec, ok := answer.(*dns.HTTPS); ok {
+			for _, param := range httpsRec.Value {
+				if _, ok := param.(*dns.SVCBECHConfig); ok {
+					echConfiglist := param.(*dns.SVCBECHConfig).ECH
+					pem := "-----BEGIN ECH CONFIGS-----\n"
+					b64 := base64.StdEncoding.EncodeToString(echConfiglist)
+					for i := 0; i < len(b64); i += 64 {
+						end := i + 64
+						if end > len(b64) {
+							end = len(b64)
+						}
+						pem += b64[i:end] + "\n"
+					}
+					pem += "-----END ECH CONFIGS-----"
+					return pem
+				}
+			}
+		}
+	}
+	return ""
+}
 
 func getTLSOptions(decoded map[string]string) T.OutboundTLSOptionsContainer {
 	if !(decoded["tls"] == "tls" || decoded["security"] == "tls" || decoded["security"] == "reality") {
@@ -41,10 +110,19 @@ func getTLSOptions(decoded map[string]string) T.OutboundTLSOptionsContainer {
 			Enabled: true,
 		}
 		if len(valECH) > 5 {
-			if !strings.Contains(valECH, "-----BEGIN ECH CONFIGS-----") {
-				valECH = "-----BEGIN ECH CONFIGS-----\n" + valECH + "\n-----END ECH CONFIGS-----"
+			var echConfigPEM string
+			// v2rayN/v2rayNG format: "domain+https://doh-url"
+			if strings.Contains(valECH, "+https://") {
+				echConfigPEM = fetchECHConfigFromDoH(valECH)
+			} else {
+				echConfigPEM = valECH
 			}
-			ECHOpts.Config = badoption.Listable[string]{valECH}
+			if echConfigPEM != "" {
+				if !strings.Contains(echConfigPEM, "-----BEGIN ECH CONFIGS-----") {
+					echConfigPEM = "-----BEGIN ECH CONFIGS-----\n" + echConfigPEM + "\n-----END ECH CONFIGS-----"
+				}
+				ECHOpts.Config = badoption.Listable[string]{echConfigPEM}
+			}
 		}
 	}
 
