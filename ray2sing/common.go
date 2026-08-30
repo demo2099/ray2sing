@@ -133,8 +133,15 @@ func fetchECHConfigFromDoH(echDomain string, dohURL string) (string, uint32) {
 }
 
 const (
-	echDoHTimeout  = 5 * time.Second
-	echNegativeTTL = 30 * time.Second
+	// Two short attempts beat one long one: config parsing blocks on this, and
+	// a single lost packet should not cost a profile its ECH config list.
+	echDoHTimeout    = 2 * time.Second
+	echDoHAttempts   = 2
+	echDoHRetryDelay = 250 * time.Millisecond
+
+	// A lookup that fails while the cache is empty is only remembered briefly,
+	// so the next parse can try again instead of being pinned to "no ECH".
+	echNegativeTTL = 10 * time.Second
 	echMinimumTTL  = 60 * time.Second
 	echMaximumTTL  = 3600 * time.Second
 )
@@ -149,16 +156,21 @@ var (
 )
 
 type echCacheEntry struct {
-	configPEM string
-	expires   time.Time
+	configPEM  string
+	expires    time.Time
+	refreshing bool
 }
 
-// cachedECHConfigFromDoH returns the cached ECH configlist for this domain and
-// DoH server, hitting the network only when the entry is missing or stale.
+// cachedECHConfigFromDoH returns the ECH config list for this domain and DoH
+// server, hitting the network only when the entry is missing or stale.
 //
-// Failures are cached briefly as well, so an unreachable DoH server cannot
-// stall every parse. A stale entry is self correcting: sing-box answers an ECH
-// rejection with a retry configlist and applies it to the next handshake.
+// The important property is that a failed refresh never costs the outbound a
+// config list it already holds. ECH config lists rotate on the order of days,
+// and a stale one is repaired by sing-box itself: the server answers an ECH
+// rejection with a retry config list and the handshake is redone with it. So on
+// failure we keep serving the previous value and refresh in the background,
+// rather than dropping to an empty config and leaving the node unconnectable
+// for as long as the DoH server stays unhappy.
 func cachedECHConfigFromDoH(echDomain string, dohURL string) string {
 	key := echDomain + "|" + dohURL
 	now := time.Now()
@@ -166,26 +178,83 @@ func cachedECHConfigFromDoH(echDomain string, dohURL string) string {
 	echCacheLock.Lock()
 	entry, found := echCacheValues[key]
 	echCacheLock.Unlock()
+
 	if found && now.Before(entry.expires) {
 		return entry.configPEM
 	}
 
-	configPEM, ttl := fetchECHConfigFromDoH(echDomain, dohURL)
-
-	cacheTTL := time.Duration(ttl) * time.Second
-	switch {
-	case configPEM == "":
-		cacheTTL = echNegativeTTL
-	case cacheTTL < echMinimumTTL:
-		cacheTTL = echMinimumTTL
-	case cacheTTL > echMaximumTTL:
-		cacheTTL = echMaximumTTL
-	}
+	configPEM, ttl := fetchECHConfigWithRetry(echDomain, dohURL)
 
 	echCacheLock.Lock()
-	echCacheValues[key] = echCacheEntry{configPEM: configPEM, expires: now.Add(cacheTTL)}
-	echCacheLock.Unlock()
-	return configPEM
+	defer echCacheLock.Unlock()
+
+	// Re-read: another parse may have refreshed the entry while we were away.
+	entry, found = echCacheValues[key]
+	if configPEM != "" {
+		echCacheValues[key] = echCacheEntry{configPEM: configPEM, expires: now.Add(clampECHTTL(ttl))}
+		return configPEM
+	}
+	if found && entry.configPEM != "" {
+		if !entry.refreshing {
+			entry.refreshing = true
+			// Extend so the stale value is not re-fetched on every parse while
+			// the background refresh is still in flight.
+			entry.expires = now.Add(echMinimumTTL)
+			echCacheValues[key] = entry
+			go backgroundECHRefresh(key, echDomain, dohURL)
+		}
+		return entry.configPEM
+	}
+	echCacheValues[key] = echCacheEntry{configPEM: "", expires: now.Add(echNegativeTTL)}
+	return ""
+}
+
+// backgroundECHRefresh retries a lookup that failed while a usable value was
+// still cached, so the next parse does not have to pay for it.
+func backgroundECHRefresh(key string, echDomain string, dohURL string) {
+	configPEM, ttl := fetchECHConfigWithRetry(echDomain, dohURL)
+	now := time.Now()
+
+	echCacheLock.Lock()
+	defer echCacheLock.Unlock()
+
+	entry := echCacheValues[key]
+	entry.refreshing = false
+	if configPEM != "" {
+		entry.configPEM = configPEM
+		entry.expires = now.Add(clampECHTTL(ttl))
+	} else if entry.configPEM == "" {
+		entry.expires = now.Add(echNegativeTTL)
+	}
+	// A failed refresh of a value we still hold leaves that value in place and
+	// clears the flag, so a later parse can try again.
+	echCacheValues[key] = entry
+}
+
+func fetchECHConfigWithRetry(echDomain string, dohURL string) (string, uint32) {
+	var configPEM string
+	var ttl uint32
+	for attempt := 0; attempt < echDoHAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(echDoHRetryDelay)
+		}
+		configPEM, ttl = fetchECHConfigFromDoH(echDomain, dohURL)
+		if configPEM != "" {
+			return configPEM, ttl
+		}
+	}
+	return "", 0
+}
+
+func clampECHTTL(ttl uint32) time.Duration {
+	cacheTTL := time.Duration(ttl) * time.Second
+	switch {
+	case cacheTTL < echMinimumTTL:
+		return echMinimumTTL
+	case cacheTTL > echMaximumTTL:
+		return echMaximumTTL
+	}
+	return cacheTTL
 }
 
 func getTLSOptions(decoded map[string]string) T.OutboundTLSOptionsContainer {
@@ -215,6 +284,11 @@ func getTLSOptions(decoded map[string]string) T.OutboundTLSOptionsContainer {
 			// v2rayN/v2rayNG format: "<ech-domain>+https://<doh-url>".
 			// Anything else is treated as an inline (base64) ECH configlist.
 			if domain, dohURL, isDoH := splitECHParam(valECH); isDoH {
+				// Tell sing-box which name publishes the config list even when
+				// the prefetch below comes back empty. Otherwise its own DNS
+				// lookup falls back to the SNI, which is not necessarily the
+				// name carrying the ECH record.
+				ECHOpts.QueryServerName = domain
 				echConfigPEM = cachedECHConfigFromDoH(domain, dohURL)
 			} else {
 				echConfigPEM = valECH
