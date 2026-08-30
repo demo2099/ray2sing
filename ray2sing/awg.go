@@ -34,13 +34,11 @@ func AWGSingboxTxt(content string) (*T.Endpoint, error) {
 			continue
 		}
 
-		// Section header
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			section = strings.ToLower(strings.Trim(line, "[]"))
 			continue
 		}
 
-		// key = value
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) != 2 {
 			continue
@@ -53,7 +51,6 @@ func AWGSingboxTxt(content string) (*T.Endpoint, error) {
 			switch key {
 			case "PrivateKey":
 				privateKey = val
-
 			case "Address":
 				for _, add := range strings.Split(val, ",") {
 					pfx, err := netip.ParsePrefix(strings.TrimSpace(add))
@@ -68,7 +65,6 @@ func AWGSingboxTxt(content string) (*T.Endpoint, error) {
 				jmin, _ = strconv.Atoi(val)
 			case "Jmax":
 				jmax, _ = strconv.Atoi(val)
-
 			case "S1":
 				s1, _ = strconv.Atoi(val)
 			case "S2":
@@ -103,14 +99,12 @@ func AWGSingboxTxt(content string) (*T.Endpoint, error) {
 				peer.PublicKey = val
 			case "PresharedKey":
 				peer.PresharedKey = val
-
 			case "AllowedIPs":
 				pfx, err := netip.ParsePrefix(val)
 				if err != nil {
 					return nil, fmt.Errorf("invalid AllowedIPs: %w", err)
 				}
 				peer.AllowedIPs = badoption.Listable[netip.Prefix]{pfx}
-
 			case "Endpoint":
 				host, portStr, err := net.SplitHostPort(val)
 				if err != nil {
@@ -122,7 +116,6 @@ func AWGSingboxTxt(content string) (*T.Endpoint, error) {
 				}
 				peer.Address = host
 				peer.Port = uint16(port)
-
 			case "PersistentKeepalive":
 				v, _ := strconv.Atoi(val)
 				peer.PersistentKeepaliveInterval = uint16(v)
@@ -138,20 +131,17 @@ func AWGSingboxTxt(content string) (*T.Endpoint, error) {
 		return nil, errors.New("missing peer Endpoint")
 	}
 	if len(peer.AllowedIPs) == 0 {
-		if len(peer.AllowedIPs) == 0 {
-			peer.AllowedIPs = badoption.Listable[netip.Prefix]([]netip.Prefix{
-				netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
-			})
-		}
+		peer.AllowedIPs = badoption.Listable[netip.Prefix]([]netip.Prefix{
+			netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+		})
 	}
 	isAwg := jc+jmin+jmax+s1+s2+s3+s4 == 0 && h1+h2+h3+h4+i1+i2+i3+i4 == ""
 	noise := defaultWireguardNoiseOptions()
 	noise.FakePacket.Enabled = isAwg
 	if true || isAwg {
-		// fmt.Println(">>out", C.TypeAwg)
 		return &T.Endpoint{
 			Type: C.TypeWireGuard,
-			Tag:  "wiregaurd",
+			Tag:  "wireguard",
 			Options: &T.WireGuardEndpointOptions{
 				PrivateKey: privateKey,
 				Address:    badoption.Listable[netip.Prefix](addresses),
@@ -170,38 +160,33 @@ func AWGSingboxTxt(content string) (*T.Endpoint, error) {
 		}, nil
 	}
 
-	out := &T.Endpoint{
-		Type: C.TypeAwg,
-		Tag:  "awg", // adjust if you derive tag elsewhere
-		Options: &T.AwgEndpointOptions{
-
-			PrivateKey: privateKey,
-			Address:    badoption.Listable[netip.Prefix](addresses),
-			Awg: T.AwgOptions{
-				Jc:   jc,
-				Jmin: jmin,
-				Jmax: jmax,
-
-				S1: s1,
-				S2: s2,
-				S3: s3,
-				S4: s4,
-				H1: h1,
-				H2: h2,
-				H3: h3,
-				H4: h4,
-
-				I1: i1,
-				I2: i2,
-				I3: i3,
-				I4: i4,
-				I5: i5,
-			},
-			Peers: []T.AwgPeerOptions{peer},
-		},
+	opts := T.AwgEndpointOptions{
+		PrivateKey: privateKey,
+		Address:    badoption.Listable[netip.Prefix](addresses),
+		Jc:         jc,
+		Jmin:       jmin,
+		Jmax:       jmax,
+		S1:         s1,
+		S2:         s2,
+		S3:         s3,
+		S4:         s4,
+		H1:         h1,
+		H2:         h2,
+		H3:         h3,
+		H4:         h4,
+		I1:         i1,
+		I2:         i2,
+		I3:         i3,
+		I4:         i4,
+		I5:         i5,
+		Peers:      []T.AwgPeerOptions{peer},
 	}
 
-	return out, nil
+	return &T.Endpoint{
+		Type:    C.TypeAwg,
+		Tag:     "awg",
+		Options: &opts,
+	}, nil
 }
 
 func AWGSingbox(raw string) (*T.Endpoint, error) {
@@ -287,31 +272,25 @@ func AWGSingbox(raw string) (*T.Endpoint, error) {
 		return nil, errors.New("missing peer_public_key")
 	}
 	opts := T.AwgEndpointOptions{
-
 		PrivateKey: pk,
 		Address:    addresses,
-
-		Awg: T.AwgOptions{
-			Jc:   getInt("jc"),
-			Jmin: getInt("jmin"),
-			Jmax: getInt("jmax"),
-
-			S1: getInt("s1"),
-			S2: getInt("s2"),
-			S3: getInt("s3"),
-			S4: getInt("s4"),
-			H1: getOneOfN(u.Params, "", "h1"),
-			H2: getOneOfN(u.Params, "", "h2"),
-			H3: getOneOfN(u.Params, "", "h3"),
-			H4: getOneOfN(u.Params, "", "h4"),
-
-			I1: getOneOfN(u.Params, "", "i1"),
-			I2: getOneOfN(u.Params, "", "i2"),
-			I3: getOneOfN(u.Params, "", "i3"),
-			I4: getOneOfN(u.Params, "", "i4"),
-			I5: getOneOfN(u.Params, "", "i5"),
-		},
-		Peers: []T.AwgPeerOptions{peer},
+		Jc:         getInt("jc"),
+		Jmin:       getInt("jmin"),
+		Jmax:       getInt("jmax"),
+		S1:         getInt("s1"),
+		S2:         getInt("s2"),
+		S3:         getInt("s3"),
+		S4:         getInt("s4"),
+		H1:         getOneOfN(u.Params, "", "h1"),
+		H2:         getOneOfN(u.Params, "", "h2"),
+		H3:         getOneOfN(u.Params, "", "h3"),
+		H4:         getOneOfN(u.Params, "", "h4"),
+		I1:         getOneOfN(u.Params, "", "i1"),
+		I2:         getOneOfN(u.Params, "", "i2"),
+		I3:         getOneOfN(u.Params, "", "i3"),
+		I4:         getOneOfN(u.Params, "", "i4"),
+		I5:         getOneOfN(u.Params, "", "i5"),
+		Peers:      []T.AwgPeerOptions{peer},
 	}
 	if mtuStr, ok := u.Params["mtu"]; ok {
 		if mtu, err := strconv.ParseUint(mtuStr, 10, 32); err == nil {
@@ -319,7 +298,24 @@ func AWGSingbox(raw string) (*T.Endpoint, error) {
 		}
 	}
 	var out *T.Endpoint
-	isAwg := opts.Awg.IsAvailble()
+
+	jc := getInt("jc")
+	jmin := getInt("jmin")
+	jmax := getInt("jmax")
+	s1 := getInt("s1")
+	s2 := getInt("s2")
+	s3 := getInt("s3")
+	s4 := getInt("s4")
+	h1 := getOneOfN(u.Params, "", "h1")
+	h2 := getOneOfN(u.Params, "", "h2")
+	h3 := getOneOfN(u.Params, "", "h3")
+	h4 := getOneOfN(u.Params, "", "h4")
+	i1 := getOneOfN(u.Params, "", "i1")
+	i2 := getOneOfN(u.Params, "", "i2")
+	i3 := getOneOfN(u.Params, "", "i3")
+	i4 := getOneOfN(u.Params, "", "i4")
+	i5 := getOneOfN(u.Params, "", "i5")
+	isAwg := jc+jmin+jmax+s1+s2+s3+s4 == 0 && h1+h2+h3+h4+i1+i2+i3+i4+i5 == ""
 
 	if true || isAwg {
 		wgopts := T.WireGuardEndpointOptions{
@@ -343,7 +339,7 @@ func AWGSingbox(raw string) (*T.Endpoint, error) {
 			for _, part := range reservedParts {
 				num, err := strconv.ParseUint(part, 10, 8)
 				if err != nil {
-					return nil, err // Handle the error appropriately
+					return nil, err
 				}
 				wgopts.Peers[0].Reserved = append(wgopts.Peers[0].Reserved, uint8(num))
 			}
