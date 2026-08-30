@@ -61,11 +61,47 @@ func ParseUrl(inputURL string, defaultPort uint16) (*UrlSchema, error) {
 		}
 	}
 
-	for key, values := range parsedURL.Query() {
-		data.Params[normalizeStr(key)] = strings.Join(values, ",")
-	}
+	data.Params = parseParams(parsedURL.RawQuery)
 
 	return data, nil
+}
+
+// parseParams decodes a raw query string while preserving literal "+" characters.
+//
+// url.URL.Query() (and url.ParseQuery) follow the HTML form convention and turn
+// every "+" into a space. Share links do not: v2rayN/v2rayNG emit the ECH
+// parameter as `ech=<ech-domain>+https://<doh-url>`, and that "+" is a real
+// separator, not an encoded space. Going through Query() silently rewrites it to
+// `ech=<ech-domain> https://<doh-url>`, which makes the DoH lookup never fire and
+// ends up as a corrupt ECH config.
+//
+// url.PathUnescape is used instead: it decodes %XX sequences but leaves "+" alone.
+func parseParams(rawQuery string) map[string]string {
+	params := make(map[string]string)
+	if rawQuery == "" {
+		return params
+	}
+	for _, pair := range strings.Split(rawQuery, "&") {
+		if pair == "" {
+			continue
+		}
+		rawKey, rawValue, _ := strings.Cut(pair, "=")
+		key, err := url.PathUnescape(rawKey)
+		if err != nil {
+			key = rawKey
+		}
+		value, err := url.PathUnescape(rawValue)
+		if err != nil {
+			value = rawValue
+		}
+		key = normalizeStr(key)
+		if existing, found := params[key]; found && existing != "" {
+			params[key] = existing + "," + value
+			continue
+		}
+		params[key] = value
+	}
+	return params
 }
 
 func normalizeStr(ss string) string {

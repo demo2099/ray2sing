@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
@@ -29,20 +30,39 @@ const USER_AGENT string = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit
 type ParserFunc func(string) (*option.Outbound, error)
 type EndpointParserFunc func(string) (*T.Endpoint, error)
 
-// fetchECHConfigFromDoH queries a DoH server for HTTPS records and extracts ECH configlist.
-// Input format: "domain+https://doh-url" (v2rayN/v2rayNG style)
-// Returns PEM-formatted ECH configlist string, or empty on failure.
-func fetchECHConfigFromDoH(echParam string) string {
-	parts := strings.SplitN(echParam, "+", 2)
-	if len(parts) != 2 {
-		return ""
+// splitECHParam recognises the v2rayN/v2rayNG ECH parameter form
+// "<ech-domain>+https://<doh-url>" and splits it into its two halves.
+//
+// The separator is accepted as a literal "+", as a plain space (share links are
+// often copied through layers that apply HTML form decoding, which rewrites "+"
+// as a space) and as "%2B" for double-encoded links. Accepting all three keeps
+// ECH working no matter which client produced or relayed the link.
+func splitECHParam(echParam string) (echDomain string, dohURL string, ok bool) {
+	for _, sep := range []string{"+https://", " https://", "%2Bhttps://"} {
+		idx := strings.Index(echParam, sep)
+		if idx < 0 {
+			continue
+		}
+		echDomain = strings.TrimSpace(echParam[:idx])
+		tail := echParam[idx:]
+		dohURL = tail[strings.Index(tail, "https://"):]
+		if echDomain == "" || dohURL == "" {
+			continue
+		}
+		return echDomain, dohURL, true
 	}
-	echDomain := parts[0]
-	dohURL := strings.TrimPrefix(parts[1], "https://")
-	if !strings.HasPrefix(parts[1], "https://") {
-		dohURL = parts[1]
+	return "", "", false
+}
+
+// fetchECHConfigFromDoH queries a DoH server for HTTPS records and extracts the
+// ECH configlist, returned as a PEM block.
+//
+// Returns "" on any failure. The caller is then expected to leave the ECH config
+// empty so sing-box resolves it itself through its own DNS router.
+func fetchECHConfigFromDoH(echDomain string, dohURL string) string {
+	if !strings.HasPrefix(dohURL, "https://") {
+		dohURL = "https://" + dohURL
 	}
-	dohURL = "https://" + dohURL
 
 	msg := new(dns.Msg)
 	msg.SetQuestion(dns.Fqdn(echDomain), dns.TypeHTTPS)
@@ -50,46 +70,63 @@ func fetchECHConfigFromDoH(echParam string) string {
 
 	data, err := msg.Pack()
 	if err != nil {
+		fmt.Printf("[ray2sing] ECH: dns pack error: %v\n", err)
 		return ""
 	}
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Post(dohURL, "application/dns-message", bytes.NewReader(data))
 	if err != nil {
+		fmt.Printf("[ray2sing] ECH: DoH request to %s failed: %v\n", dohURL, err)
 		return ""
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("[ray2sing] ECH: DoH %s returned status %d\n", dohURL, resp.StatusCode)
+		return ""
+	}
 
 	respData, err := io.ReadAll(resp.Body)
 	if err != nil {
+		fmt.Printf("[ray2sing] ECH: DoH read error: %v\n", err)
 		return ""
 	}
 
 	respMsg := new(dns.Msg)
 	if err := respMsg.Unpack(respData); err != nil {
+		fmt.Printf("[ray2sing] ECH: dns unpack error: %v\n", err)
+		return ""
+	}
+	if respMsg.Rcode != dns.RcodeSuccess {
+		fmt.Printf("[ray2sing] ECH: DoH rcode %d for %s\n", respMsg.Rcode, echDomain)
 		return ""
 	}
 
 	for _, answer := range respMsg.Answer {
-		if httpsRec, ok := answer.(*dns.HTTPS); ok {
-			for _, param := range httpsRec.Value {
-				if _, ok := param.(*dns.SVCBECHConfig); ok {
-					echConfiglist := param.(*dns.SVCBECHConfig).ECH
-					pem := "-----BEGIN ECH CONFIGS-----\n"
-					b64 := base64.StdEncoding.EncodeToString(echConfiglist)
-					for i := 0; i < len(b64); i += 64 {
-						end := i + 64
-						if end > len(b64) {
-							end = len(b64)
-						}
-						pem += b64[i:end] + "\n"
-					}
-					pem += "-----END ECH CONFIGS-----"
-					return pem
-				}
+		httpsRec, isHTTPS := answer.(*dns.HTTPS)
+		if !isHTTPS {
+			continue
+		}
+		for _, param := range httpsRec.Value {
+			echValue, isECH := param.(*dns.SVCBECHConfig)
+			if !isECH {
+				continue
 			}
+			b64 := base64.StdEncoding.EncodeToString(echValue.ECH)
+			configPEM := "-----BEGIN ECH CONFIGS-----\n"
+			for i := 0; i < len(b64); i += 64 {
+				end := i + 64
+				if end > len(b64) {
+					end = len(b64)
+				}
+				configPEM += b64[i:end] + "\n"
+			}
+			configPEM += "-----END ECH CONFIGS-----"
+			fmt.Printf("[ray2sing] ECH: got %d byte configlist for %s\n", len(echValue.ECH), echDomain)
+			return configPEM
 		}
 	}
+	fmt.Printf("[ray2sing] ECH: no ech value in HTTPS record for %s\n", echDomain)
 	return ""
 }
 
@@ -109,11 +146,13 @@ func getTLSOptions(decoded map[string]string) T.OutboundTLSOptionsContainer {
 		ECHOpts = &option.OutboundECHOptions{
 			Enabled: true,
 		}
+		valECH = strings.TrimSpace(valECH)
 		if len(valECH) > 5 {
 			var echConfigPEM string
-			// v2rayN/v2rayNG format: "domain+https://doh-url"
-			if strings.Contains(valECH, "+https://") {
-				echConfigPEM = fetchECHConfigFromDoH(valECH)
+			// v2rayN/v2rayNG format: "<ech-domain>+https://<doh-url>".
+			// Anything else is treated as an inline (base64) ECH configlist.
+			if domain, dohURL, isDoH := splitECHParam(valECH); isDoH {
+				echConfigPEM = fetchECHConfigFromDoH(domain, dohURL)
 			} else {
 				echConfigPEM = valECH
 			}
@@ -121,7 +160,15 @@ func getTLSOptions(decoded map[string]string) T.OutboundTLSOptionsContainer {
 				if !strings.Contains(echConfigPEM, "-----BEGIN ECH CONFIGS-----") {
 					echConfigPEM = "-----BEGIN ECH CONFIGS-----\n" + echConfigPEM + "\n-----END ECH CONFIGS-----"
 				}
-				ECHOpts.Config = badoption.Listable[string]{echConfigPEM}
+				// sing-box hard-fails the outbound on a malformed PEM
+				// ("invalid ECH configs pem"), which would make the node
+				// unreachable. Drop the config instead and let sing-box resolve
+				// ECH itself through its DNS router.
+				if block, rest := pem.Decode([]byte(echConfigPEM)); block != nil && block.Type == "ECH CONFIGS" && len(rest) == 0 {
+					ECHOpts.Config = badoption.Listable[string]{echConfigPEM}
+				} else {
+					fmt.Printf("[ray2sing] ECH: malformed config for node, falling back to sing-box DNS lookup\n")
+				}
 			}
 		}
 	}
