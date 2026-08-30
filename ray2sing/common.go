@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	C "github.com/sagernet/sing-box/constant"
@@ -55,11 +56,12 @@ func splitECHParam(echParam string) (echDomain string, dohURL string, ok bool) {
 }
 
 // fetchECHConfigFromDoH queries a DoH server for HTTPS records and extracts the
-// ECH configlist, returned as a PEM block.
+// ECH configlist, returned as a PEM block together with the record TTL in
+// seconds.
 //
 // Returns "" on any failure. The caller is then expected to leave the ECH config
 // empty so sing-box resolves it itself through its own DNS router.
-func fetchECHConfigFromDoH(echDomain string, dohURL string) string {
+func fetchECHConfigFromDoH(echDomain string, dohURL string) (string, uint32) {
 	if !strings.HasPrefix(dohURL, "https://") {
 		dohURL = "https://" + dohURL
 	}
@@ -71,35 +73,35 @@ func fetchECHConfigFromDoH(echDomain string, dohURL string) string {
 	data, err := msg.Pack()
 	if err != nil {
 		fmt.Printf("[ray2sing] ECH: dns pack error: %v\n", err)
-		return ""
+		return "", 0
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: echDoHTimeout}
 	resp, err := client.Post(dohURL, "application/dns-message", bytes.NewReader(data))
 	if err != nil {
 		fmt.Printf("[ray2sing] ECH: DoH request to %s failed: %v\n", dohURL, err)
-		return ""
+		return "", 0
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		fmt.Printf("[ray2sing] ECH: DoH %s returned status %d\n", dohURL, resp.StatusCode)
-		return ""
+		return "", 0
 	}
 
 	respData, err := io.ReadAll(resp.Body)
 	if err != nil {
 		fmt.Printf("[ray2sing] ECH: DoH read error: %v\n", err)
-		return ""
+		return "", 0
 	}
 
 	respMsg := new(dns.Msg)
 	if err := respMsg.Unpack(respData); err != nil {
 		fmt.Printf("[ray2sing] ECH: dns unpack error: %v\n", err)
-		return ""
+		return "", 0
 	}
 	if respMsg.Rcode != dns.RcodeSuccess {
 		fmt.Printf("[ray2sing] ECH: DoH rcode %d for %s\n", respMsg.Rcode, echDomain)
-		return ""
+		return "", 0
 	}
 
 	for _, answer := range respMsg.Answer {
@@ -123,11 +125,67 @@ func fetchECHConfigFromDoH(echDomain string, dohURL string) string {
 			}
 			configPEM += "-----END ECH CONFIGS-----"
 			fmt.Printf("[ray2sing] ECH: got %d byte configlist for %s\n", len(echValue.ECH), echDomain)
-			return configPEM
+			return configPEM, httpsRec.Hdr.Ttl
 		}
 	}
 	fmt.Printf("[ray2sing] ECH: no ech value in HTTPS record for %s\n", echDomain)
-	return ""
+	return "", 0
+}
+
+const (
+	echDoHTimeout  = 5 * time.Second
+	echNegativeTTL = 30 * time.Second
+	echMinimumTTL  = 60 * time.Second
+	echMaximumTTL  = 3600 * time.Second
+)
+
+// ECH configlists rotate rarely, but getTLSOptions runs for every outbound on
+// every config parse. Without a cache, a subscription holding a handful of ECH
+// nodes pays a DoH round trip (up to echDoHTimeout each) every single time the
+// profile is rebuilt.
+var (
+	echCacheLock   sync.Mutex
+	echCacheValues = make(map[string]echCacheEntry)
+)
+
+type echCacheEntry struct {
+	configPEM string
+	expires   time.Time
+}
+
+// cachedECHConfigFromDoH returns the cached ECH configlist for this domain and
+// DoH server, hitting the network only when the entry is missing or stale.
+//
+// Failures are cached briefly as well, so an unreachable DoH server cannot
+// stall every parse. A stale entry is self correcting: sing-box answers an ECH
+// rejection with a retry configlist and applies it to the next handshake.
+func cachedECHConfigFromDoH(echDomain string, dohURL string) string {
+	key := echDomain + "|" + dohURL
+	now := time.Now()
+
+	echCacheLock.Lock()
+	entry, found := echCacheValues[key]
+	echCacheLock.Unlock()
+	if found && now.Before(entry.expires) {
+		return entry.configPEM
+	}
+
+	configPEM, ttl := fetchECHConfigFromDoH(echDomain, dohURL)
+
+	cacheTTL := time.Duration(ttl) * time.Second
+	switch {
+	case configPEM == "":
+		cacheTTL = echNegativeTTL
+	case cacheTTL < echMinimumTTL:
+		cacheTTL = echMinimumTTL
+	case cacheTTL > echMaximumTTL:
+		cacheTTL = echMaximumTTL
+	}
+
+	echCacheLock.Lock()
+	echCacheValues[key] = echCacheEntry{configPEM: configPEM, expires: now.Add(cacheTTL)}
+	echCacheLock.Unlock()
+	return configPEM
 }
 
 func getTLSOptions(decoded map[string]string) T.OutboundTLSOptionsContainer {
@@ -142,7 +200,12 @@ func getTLSOptions(decoded map[string]string) T.OutboundTLSOptionsContainer {
 
 	var ECHOpts *option.OutboundECHOptions
 	valECH, hasECH := decoded["ech"]
-	if hasECH {
+	// Reality and ECH are mutually exclusive and sing-box rejects the combination
+	// outright. The callers assign Reality after this function returns, so the
+	// conflict can only be avoided here.
+	if hasECH && decoded["security"] == "reality" {
+		fmt.Printf("[ray2sing] ECH: ignored for node, reality already in use\n")
+	} else if hasECH {
 		ECHOpts = &option.OutboundECHOptions{
 			Enabled: true,
 		}
@@ -152,7 +215,7 @@ func getTLSOptions(decoded map[string]string) T.OutboundTLSOptionsContainer {
 			// v2rayN/v2rayNG format: "<ech-domain>+https://<doh-url>".
 			// Anything else is treated as an inline (base64) ECH configlist.
 			if domain, dohURL, isDoH := splitECHParam(valECH); isDoH {
-				echConfigPEM = fetchECHConfigFromDoH(domain, dohURL)
+				echConfigPEM = cachedECHConfigFromDoH(domain, dohURL)
 			} else {
 				echConfigPEM = valECH
 			}
