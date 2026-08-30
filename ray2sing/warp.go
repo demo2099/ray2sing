@@ -1,10 +1,13 @@
 package ray2sing
 
 import (
+	"net/netip"
 	"strconv"
+	"strings"
 
 	C "github.com/sagernet/sing-box/constant"
 	T "github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/json/badoption"
 )
 
 func WarpSingbox(url string) (*T.Endpoint, error) {
@@ -19,44 +22,62 @@ func WarpSingbox(url string) (*T.Endpoint, error) {
 		}
 		return 0
 	}
-	// fmt.Println(u.Username, "-", u.Password, "-", u.Params)
-	out := T.Endpoint{
-		Type: C.TypeWARP,
-		Tag:  u.Name,
-		Options: &T.WARPEndpointOptions{
-			ServerOptions: T.ServerOptions{
-				Server:     u.Hostname,
-				ServerPort: u.Port,
-			},
-			UniqueIdentifier: u.Username,
-			Noise:            getWireGuardNoise(u.Params, false),
-			MTU:              uint32(toInt(getOneOfN(u.Params, "1280", "mtu"))),
 
-			AWG: &T.AwgOptions{
-				Jc:   getInt("jc"),
-				Jmin: getInt("jmin"),
-				Jmax: getInt("jmax"),
+	// WARP not available in sing-box v4.1.0, fallback to WireGuard
+	allowedIPs := func() badoption.Listable[netip.Prefix] {
+		raw := getOneOfN(u.Params, "", "allowedips", "localaddress")
+		var out []netip.Prefix
+		for _, s := range strings.Split(raw, ",") {
+			if s != "" {
+				p, _ := netip.ParsePrefix(strings.TrimSpace(s))
+				if p.IsValid() {
+					out = append(out, p)
+				}
+			}
+		}
+		if len(out) == 0 {
+			out = []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")}
+		}
+		return badoption.Listable[netip.Prefix](out)
+	}()
 
-				S1: getInt("s1"),
-				S2: getInt("s2"),
-				S3: getInt("s3"),
-				S4: getInt("s4"),
-				H1: getOneOfN(u.Params, "", "h1"),
-				H2: getOneOfN(u.Params, "", "h2"),
-				H3: getOneOfN(u.Params, "", "h3"),
-				H4: getOneOfN(u.Params, "", "h4"),
-
-				I1: getOneOfN(u.Params, "", "i1"),
-				I2: getOneOfN(u.Params, "", "i2"),
-				I3: getOneOfN(u.Params, "", "i3"),
-				I4: getOneOfN(u.Params, "", "i4"),
-				I5: getOneOfN(u.Params, "", "i5"),
+	wgopts := T.WireGuardEndpointOptions{
+		PrivateKey: u.Username,
+		Peers: []T.WireGuardPeer{
+			T.WireGuardPeer{
+				Address:                     u.Hostname,
+				Port:                        u.Port,
+				PublicKey:                   getOneOfN(u.Params, "", "publickey", "peerpublickey", "pub"),
+				PreSharedKey:                getOneOfN(u.Params, "", "presharedkey", "psk"),
+				AllowedIPs:                  allowedIPs,
+				PersistentKeepaliveInterval: func() uint16 { v, _ := strconv.Atoi(getOneOfN(u.Params, "", "keepalive")); return uint16(v) }(),
 			},
 		},
+		MTU:   uint32(toInt(getOneOfN(u.Params, "1280", "mtu"))),
+		Noise: getWireGuardNoise(u.Params, false),
+	}
+	if reservedStr, ok := u.Params["reserved"]; ok {
+		reservedParts := strings.Split(reservedStr, ",")
+		for _, part := range reservedParts {
+			num, err := strconv.ParseUint(part, 10, 8)
+			if err == nil {
+				wgopts.Peers[0].Reserved = append(wgopts.Peers[0].Reserved, uint8(num))
+			}
+		}
+	}
+	if workerStr, ok := u.Params["workers"]; ok {
+		if workers, err := strconv.Atoi(workerStr); err == nil {
+			wgopts.Workers = workers
+		}
 	}
 
+	out := &T.Endpoint{
+		Type:    C.TypeWireGuard,
+		Tag:     u.Name,
+		Options: &wgopts,
+	}
 	if out.Tag == "" {
 		out.Tag = "WARP"
 	}
-	return &out, nil
+	return out, nil
 }
