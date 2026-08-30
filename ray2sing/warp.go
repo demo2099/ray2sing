@@ -15,14 +15,6 @@ func WarpSingbox(url string) (*T.Endpoint, error) {
 	if err != nil {
 		return nil, err
 	}
-	getInt := func(key string) int {
-		if v, ok := u.Params[key]; ok {
-			i, _ := strconv.Atoi(v)
-			return i
-		}
-		return 0
-	}
-
 	// WARP not available in sing-box v4.1.0, fallback to WireGuard
 	allowedIPs := func() badoption.Listable[netip.Prefix] {
 		raw := getOneOfN(u.Params, "", "allowedips", "localaddress")
