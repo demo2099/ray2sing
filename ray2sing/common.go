@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -61,7 +62,15 @@ func splitECHParam(echParam string) (echDomain string, dohURL string, ok bool) {
 //
 // Returns "" on any failure. The caller is then expected to leave the ECH config
 // empty so sing-box resolves it itself through its own DNS router.
-func fetchECHConfigFromDoH(echDomain string, dohURL string) (string, uint32) {
+func fetchECHConfigFromDoH(echDomain string, dohURL string) (configPEM string, ttl uint32) {
+	defer func() {
+		if r := recover(); r != nil {
+			buf := make([]byte, 1<<20)
+			n := runtime.Stack(buf, false)
+			writeCrashLog("fetchECHConfigFromDoH", fmt.Sprintf("%v", r), buf[:n])
+			configPEM, ttl = "", 0
+		}
+	}()
 	if !strings.HasPrefix(dohURL, "https://") {
 		dohURL = "https://" + dohURL
 	}
@@ -114,8 +123,8 @@ func fetchECHConfigFromDoH(echDomain string, dohURL string) (string, uint32) {
 			if !isECH {
 				continue
 			}
-			b64 := base64.StdEncoding.EncodeToString(echValue.ECH)
-			configPEM := "-----BEGIN ECH CONFIGS-----\n"
+		b64 := base64.StdEncoding.EncodeToString(echValue.ECH)
+		configPEM = "-----BEGIN ECH CONFIGS-----\n"
 			for i := 0; i < len(b64); i += 64 {
 				end := i + 64
 				if end > len(b64) {
@@ -211,7 +220,21 @@ func cachedECHConfigFromDoH(echDomain string, dohURL string) string {
 
 // backgroundECHRefresh retries a lookup that failed while a usable value was
 // still cached, so the next parse does not have to pay for it.
+//
+// This runs as a bare background goroutine spawned from cachedECHConfigFromDoH.
+// An unrecovered panic here kills the whole in-process gomobile core with no
+// tombstone — the classic intermittent "enable node → app vanishes" crash — so
+// the entire body is wrapped in recover(). On any panic we just leave the
+// cached entry as-is (the defer in fetchECHConfigFromDoH already returns ""),
+// which is the safe failure mode: a stale-but-usable ECH config beats none.
 func backgroundECHRefresh(key string, echDomain string, dohURL string) {
+	defer func() {
+		if r := recover(); r != nil {
+			buf := make([]byte, 1<<20)
+			n := runtime.Stack(buf, false)
+			writeCrashLog("backgroundECHRefresh", fmt.Sprintf("%v", r), buf[:n])
+		}
+	}()
 	configPEM, ttl := fetchECHConfigWithRetry(echDomain, dohURL)
 	now := time.Now()
 
