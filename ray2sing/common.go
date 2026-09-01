@@ -180,7 +180,22 @@ type echCacheEntry struct {
 // failure we keep serving the previous value and refresh in the background,
 // rather than dropping to an empty config and leaving the node unconnectable
 // for as long as the DoH server stays unhappy.
-func cachedECHConfigFromDoH(echDomain string, dohURL string) string {
+// cachedECHConfigFromDoH is the synchronous entry point called during config
+// parsing (i.e. when a profile is enabled). Because it runs on the main path,
+// an unrecovered panic here would abort the whole in-process gomobile core and
+// flash-close the app — the classic "enable node → app vanishes" crash. Wrap
+// the body so any panic degrades to "no ECH config" instead of killing the
+// process. This mirrors the recover() guard already present in
+// fetchECHConfigFromDoH and backgroundECHRefresh.
+func cachedECHConfigFromDoH(echDomain string, dohURL string) (ret string) {
+	defer func() {
+		if r := recover(); r != nil {
+			buf := make([]byte, 1<<20)
+			n := runtime.Stack(buf, false)
+			writeCrashLog("cachedECHConfigFromDoH", fmt.Sprintf("%v", r), buf[:n])
+			ret = ""
+		}
+	}()
 	key := echDomain + "|" + dohURL
 	now := time.Now()
 
@@ -303,33 +318,51 @@ func getTLSOptions(decoded map[string]string) T.OutboundTLSOptionsContainer {
 		}
 		valECH = strings.TrimSpace(valECH)
 		if len(valECH) > 5 {
-			var echConfigPEM string
-			// v2rayN/v2rayNG format: "<ech-domain>+https://<doh-url>".
-			// Anything else is treated as an inline (base64) ECH configlist.
-			if domain, dohURL, isDoH := splitECHParam(valECH); isDoH {
-				// Tell sing-box which name publishes the config list even when
-				// the prefetch below comes back empty. Otherwise its own DNS
-				// lookup falls back to the SNI, which is not necessarily the
-				// name carrying the ECH record.
-				ECHOpts.QueryServerName = domain
-				echConfigPEM = cachedECHConfigFromDoH(domain, dohURL)
-			} else {
-				echConfigPEM = valECH
-			}
-			if echConfigPEM != "" {
-				if !strings.Contains(echConfigPEM, "-----BEGIN ECH CONFIGS-----") {
-					echConfigPEM = "-----BEGIN ECH CONFIGS-----\n" + echConfigPEM + "\n-----END ECH CONFIGS-----"
-				}
-				// sing-box hard-fails the outbound on a malformed PEM
-				// ("invalid ECH configs pem"), which would make the node
-				// unreachable. Drop the config instead and let sing-box resolve
-				// ECH itself through its DNS router.
-				if block, rest := pem.Decode([]byte(echConfigPEM)); block != nil && block.Type == "ECH CONFIGS" && len(rest) == 0 {
-					ECHOpts.Config = badoption.Listable[string]{echConfigPEM}
+			// The synchronous ECH resolution below runs on the main config
+			// parse path (i.e. when a profile is enabled). Wrap it so any panic
+			// degrades to "no ECH config" instead of aborting the in-process
+			// gomobile core and flash-closing the app. This mirrors the recover()
+			// guards already present in fetchECHConfigFromDoH,
+			// cachedECHConfigFromDoH and backgroundECHRefresh.
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						buf := make([]byte, 1<<20)
+						n := runtime.Stack(buf, false)
+						writeCrashLog("getTLSOptions.ECH", fmt.Sprintf("%v", r), buf[:n])
+						// Graceful degradation: drop ECH for this node so the
+						// outbound still connects via sing-box's own DNS router.
+						ECHOpts = nil
+					}
+				}()
+				var echConfigPEM string
+				// v2rayN/v2rayNG format: "<ech-domain>+https://<doh-url>".
+				// Anything else is treated as an inline (base64) ECH configlist.
+				if domain, dohURL, isDoH := splitECHParam(valECH); isDoH {
+					// Tell sing-box which name publishes the config list even when
+					// the prefetch below comes back empty. Otherwise its own DNS
+					// lookup falls back to the SNI, which is not necessarily the
+					// name carrying the ECH record.
+					ECHOpts.QueryServerName = domain
+					echConfigPEM = cachedECHConfigFromDoH(domain, dohURL)
 				} else {
-					fmt.Printf("[ray2sing] ECH: malformed config for node, falling back to sing-box DNS lookup\n")
+					echConfigPEM = valECH
 				}
-			}
+				if echConfigPEM != "" {
+					if !strings.Contains(echConfigPEM, "-----BEGIN ECH CONFIGS-----") {
+						echConfigPEM = "-----BEGIN ECH CONFIGS-----\n" + echConfigPEM + "\n-----END ECH CONFIGS-----"
+					}
+					// sing-box hard-fails the outbound on a malformed PEM
+					// ("invalid ECH configs pem"), which would make the node
+					// unreachable. Drop the config instead and let sing-box resolve
+					// ECH itself through its DNS router.
+					if block, rest := pem.Decode([]byte(echConfigPEM)); block != nil && block.Type == "ECH CONFIGS" && len(rest) == 0 {
+						ECHOpts.Config = badoption.Listable[string]{echConfigPEM}
+					} else {
+						fmt.Printf("[ray2sing] ECH: malformed config for node, falling back to sing-box DNS lookup\n")
+					}
+				}
+			}()
 		}
 	}
 
